@@ -5,11 +5,44 @@
 // @description  On x.com/<user>/media: robust auto-scroll (detects real scroller, with scrollIntoView fallback), then list filenames (IMG + MP4; no m3u8).
 // @match        https://x.com/*
 // @run-at       document-idle
+// @grant        GM_openInTab
+// @grant        GM_setValue
+// @grant        GM_addValueChangeListener
 // @noframes
 // ==/UserScript==
 
 (function () {
   'use strict';
+
+  const DEBUG_CAPTURE_KEY = 'xm-debug-capture';
+  const DEBUG_CAPTURE_TIMEOUT = 45000;
+  const DEBUG_SNIPPET_LIMIT = 8000;
+  const LOG_PREFIX = '[xm-debug]';
+  let debugBridgeInitialized = false;
+
+  /* -------------------- Visibility shim -------------------- */
+  (function ensureVisibleEnvironment() {
+    try {
+      const hiddenDesc = Object.getOwnPropertyDescriptor(Document.prototype, 'hidden');
+      if (!hiddenDesc || hiddenDesc.configurable) {
+        Object.defineProperty(document, 'hidden', { configurable: true, get: () => false });
+      }
+    } catch (err) {
+      try { console.debug(LOG_PREFIX, 'failed to override document.hidden', err?.message || err); } catch { /* noop */ }
+    }
+    try {
+      const visDesc = Object.getOwnPropertyDescriptor(Document.prototype, 'visibilityState');
+      if (!visDesc || visDesc.configurable) {
+        Object.defineProperty(document, 'visibilityState', { configurable: true, get: () => 'visible' });
+      }
+    } catch (err) {
+      try { console.debug(LOG_PREFIX, 'failed to override document.visibilityState', err?.message || err); } catch { /* noop */ }
+    }
+    const suppressVisibilityChange = (ev) => {
+      ev.stopImmediatePropagation();
+    };
+    document.addEventListener('visibilitychange', suppressVisibilityChange, true);
+  })();
 
   /* -------------------- URL change watcher (SPA) -------------------- */
   const onUrlChange = (() => {
@@ -86,52 +119,106 @@
         <span class="xm-draghint">drag me</span>
       </div>
       <div class="xm-controls">
-        <button id="xm-btn-collect" class="xm-btn">収集</button>
-        <button id="xm-btn-download" class="xm-btn" disabled>ダウンロード</button>
+        <button id="xm-btn-url" class="xm-btn">URL収集</button>
+        <button id="xm-btn-media" class="xm-btn" disabled>メディア取得</button>
+        <button id="xm-btn-download" class="xm-btn" disabled>ZIPダウンロード</button>
         <button id="xm-btn-stop" class="xm-btn" style="display:none">停止</button>
       </div>
+      <label style="padding:0 10px 8px 10px; display:flex; align-items:center; gap:6px; font-size:11px; opacity:.8;">
+        <input type="checkbox" id="xm-debug-toggle" style="margin:0;">デバッグ（最初の1件のみ）
+      </label>
       <div class="xm-status" id="xm-status">mediaページ検出</div>
       <div class="xm-list" id="xm-list"><ul id="xm-ul"></ul></div>
+      <div id="xm-debug-box" style="display:none; margin:0 10px 10px 10px; padding:8px; border-radius:8px; background:rgba(255,255,255,.08); max-height:160px; overflow:auto; font-family:monospace; font-size:11px; white-space:pre-wrap;">
+        <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:4px; gap:8px;">
+          <span style="font-weight:600;">Debug HTML Preview</span>
+          <button id="xm-debug-copy" class="xm-btn" style="padding:4px 8px; font-size:10px; border-radius:6px;" disabled>コピー</button>
+        </div>
+        <pre id="xm-debug-pre" style="margin:0; white-space:pre-wrap;"></pre>
+      </div>
     `;
     document.body.appendChild(panel);
-    document.getElementById('xm-btn-collect').addEventListener('click', onClickCollect);
-    document.getElementById('xm-btn-download').addEventListener('click', () => setStatus('ダウンロード（未実装）'));
+    document.getElementById('xm-btn-url').addEventListener('click', onClickCollectUrls);
+    document.getElementById('xm-btn-media').addEventListener('click', onClickCollectMedia);
+    document.getElementById('xm-btn-download').addEventListener('click', () => setStatus('ZIP ダウンロードは未実装です'));
+    const debugToggle = document.getElementById('xm-debug-toggle');
+    if (debugToggle) {
+      debugToggle.checked = state.debug;
+      debugToggle.addEventListener('change', () => {
+        state.debug = debugToggle.checked;
+        if (state.debug) {
+          setStatus('デバッグモード: メディア取得は最初の1件のみ');
+          setDebugHtml('(debug) HTML未取得');
+        } else {
+          setStatus('デバッグモード解除');
+          setDebugHtml('');
+        }
+      });
+    }
+    setDebugHtml(state.debug ? '(debug) HTML未取得' : '');
+    const copyBtn = document.getElementById('xm-debug-copy');
+    if (copyBtn) {
+      copyBtn.addEventListener('click', async () => {
+        if (!state.debugHtmlRaw) return;
+        try {
+          await navigator.clipboard.writeText(state.debugHtmlRaw);
+          setStatus('デバッグHTMLをクリップボードへコピーしました');
+        } catch (err) {
+          console.error('clipboard write failed', err);
+          setStatus('クリップボードへのコピーに失敗しました');
+        }
+      });
+      copyBtn.disabled = !state.debugHtmlRaw;
+    }
     makeDraggable(panel);
   }
   function removePanel() { const el = document.getElementById(PANEL_ID); if (el) el.remove(); }
   function setStatus(text) { const s = document.getElementById('xm-status'); if (s) s.textContent = text; }
-    function renderList(items) {
-        const ul = document.getElementById('xm-ul'); if (!ul) return;
-        ul.innerHTML = '';
-        const frag = document.createDocumentFragment();
 
-        for (const it of items) {
-            const li = document.createElement('li');
+  function debugLog(...args) {
+    if (!state.debug && !shouldCloseDebugTabAfterSend) return;
+    try {
+      console.debug(LOG_PREFIX, ...args);
+    } catch (err) {
+      // ignore logging errors
+    }
+  }
 
-            // 種別ラベル [IMG] / [MP4]
-            const spanType = document.createElement('span');
-            spanType.className = 'type';
-            spanType.textContent = `[${it.type.toUpperCase()}]`;
-            li.appendChild(spanType);
+  function renderTweetList(items) {
+    const ul = document.getElementById('xm-ul'); if (!ul) return;
+    ul.innerHTML = '';
+    const frag = document.createDocumentFragment();
+    items.forEach((it) => {
+      const li = document.createElement('li');
 
-      // ファイル名をリンク化（新規タブで開く）
+      const spanType = document.createElement('span');
+      spanType.className = 'type';
+      spanType.textContent = '[URL]';
+      li.appendChild(spanType);
+
       const a = document.createElement('a');
       a.href = it.url;
-      a.textContent = it.filename;
+      a.textContent = `${it.screenName}/${it.tweetId}`;
       a.target = '_blank';
       a.rel = 'noopener noreferrer';
-      // 長いURLでも見やすいように
       a.style.color = '#aee3ff';
       a.style.textDecoration = 'none';
       a.addEventListener('mouseenter', () => a.style.textDecoration = 'underline');
       a.addEventListener('mouseleave', () => a.style.textDecoration = 'none');
-
       li.appendChild(a);
-      frag.appendChild(li);
-  }
 
+      if (it.mediaSummary) {
+        const summary = document.createElement('span');
+        summary.style.marginLeft = '8px';
+        summary.style.opacity = '0.7';
+        summary.textContent = `(${it.mediaSummary})`;
+        li.appendChild(summary);
+      }
+
+      frag.appendChild(li);
+    });
     ul.appendChild(frag);
-}
+  }
   function makeDraggable(el) {
     let sx, sy, px, py, dragging = false;
     el.addEventListener('mousedown', (e) => {
@@ -147,15 +234,430 @@
     addEventListener('mouseup', () => dragging = false);
   }
 
+  function renderMediaList(items) {
+    const ul = document.getElementById('xm-ul'); if (!ul) return;
+    ul.innerHTML = '';
+    const frag = document.createDocumentFragment();
+    items.forEach((it) => {
+      const li = document.createElement('li');
+
+      const spanType = document.createElement('span');
+      spanType.className = 'type';
+      spanType.textContent = `[${it.type.toUpperCase()}]`;
+      li.appendChild(spanType);
+
+      const a = document.createElement('a');
+      a.href = it.url;
+      a.textContent = it.filename || it.url;
+      a.target = '_blank';
+      a.rel = 'noopener noreferrer';
+      a.style.color = '#aee3ff';
+      a.style.textDecoration = 'none';
+      a.addEventListener('mouseenter', () => a.style.textDecoration = 'underline');
+      a.addEventListener('mouseleave', () => a.style.textDecoration = 'none');
+      li.appendChild(a);
+
+      const meta = document.createElement('span');
+      meta.style.marginLeft = '8px';
+      meta.style.opacity = '0.7';
+      meta.textContent = `(@${it.screenName} ${it.tweetId})`;
+      li.appendChild(meta);
+
+      frag.appendChild(li);
+    });
+    ul.appendChild(frag);
+  }
+
+  function setDebugHtml(content, raw = '') {
+    const box = document.getElementById('xm-debug-box');
+    const pre = document.getElementById('xm-debug-pre');
+    const btn = document.getElementById('xm-debug-copy');
+    if (!box || !pre) return;
+    if (!content) {
+      pre.textContent = '';
+      box.style.display = state.debug ? 'block' : 'none';
+      state.debugHtmlRaw = '';
+      if (btn) btn.disabled = true;
+      return;
+    }
+    pre.textContent = content;
+    box.style.display = 'block';
+    state.debugHtmlRaw = raw || '';
+    if (btn) btn.disabled = !state.debugHtmlRaw;
+    debugLog('setDebugHtml', { previewLength: content.length, rawLength: raw?.length || 0 });
+  }
+
+  function createDebugSnippet(raw) {
+    if (!raw) return '';
+    return raw.length > DEBUG_SNIPPET_LIMIT ? raw.slice(0, DEBUG_SNIPPET_LIMIT) + '\n... (truncated)' : raw;
+  }
+
+  /* -------------------- Debug capture bridge -------------------- */
+
+  function initDebugBridge() {
+    if (debugBridgeInitialized) return;
+    debugBridgeInitialized = true;
+    if (typeof GM_addValueChangeListener === 'function') {
+      GM_addValueChangeListener(DEBUG_CAPTURE_KEY, (_name, _oldValue, newValue, remote) => {
+        if (!remote || !newValue) return;
+        handleDebugCaptureMessage(safeJsonParse(newValue));
+      });
+    }
+    window.addEventListener('storage', (event) => {
+      if (event.key !== DEBUG_CAPTURE_KEY || !event.newValue) return;
+      handleDebugCaptureMessage(safeJsonParse(event.newValue));
+    });
+  }
+
+  function safeJsonParse(str) {
+    try { return JSON.parse(str); } catch { return null; }
+  }
+
+  function handleDebugCaptureMessage(msg) {
+    if (!msg || !msg.token) return;
+    if (state.debugCaptureToken !== msg.token) return;
+    debugLog('handleDebugCaptureMessage', { hasError: !!msg.error, rawLength: msg.raw?.length || 0 });
+    clearDebugCaptureTimeout();
+    state.debugCaptureToken = null;
+    const waiter = state.debugCaptureWaiters.get(msg.token);
+    if (state.debugTabRef && typeof state.debugTabRef.close === 'function' && msg.autoClose) {
+      try { state.debugTabRef.close(); debugLog('closed debug tab via GM handle'); } catch { /* noop */ }
+    }
+    state.debugTabRef = null;
+    if (waiter) {
+      state.debugCaptureWaiters.delete(msg.token);
+    }
+    if (msg.error) {
+      setDebugHtml(`(debug) ${msg.error}`, msg.raw || '');
+      setStatus('デバッグHTML取得に失敗: ' + msg.error);
+      waiter?.reject(new Error(msg.error));
+      return;
+    }
+    const raw = msg.raw || '';
+    const snippet = msg.snippet || createDebugSnippet(raw);
+    setDebugHtml(snippet, raw);
+    if (msg.mediaReady === false) {
+      setStatus('デバッグHTMLを取得しました（メディア要素未検出）');
+    } else {
+      setStatus('デバッグHTMLを取得しました');
+    }
+    debugLog('debug HTML received', { mediaReady: msg.mediaReady !== false });
+    waiter?.resolve({ raw, mediaReady: msg.mediaReady !== false });
+  }
+
+  function clearDebugCaptureTimeout() {
+    if (state.debugCaptureTimer) {
+      clearTimeout(state.debugCaptureTimer);
+      state.debugCaptureTimer = null;
+    }
+  }
+
+  function startDebugCapture(tweet) {
+    if (!tweet) return null;
+    initDebugBridge();
+    if (state.debugCaptureToken) {
+      const waiter = state.debugCaptureWaiters.get(state.debugCaptureToken);
+      if (waiter) return { token: state.debugCaptureToken, promise: waiter.promise };
+      return { token: state.debugCaptureToken, promise: Promise.reject(new Error('debug capture in progress')) };
+    }
+    const token = `dbg-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    let resolveFn;
+    let rejectFn;
+    const promise = new Promise((resolve, reject) => {
+      resolveFn = resolve;
+      rejectFn = reject;
+    });
+    state.debugCaptureWaiters.set(token, { resolve: resolveFn, reject: rejectFn, promise });
+    state.debugCaptureToken = token;
+    setDebugHtml('(debug) JavaScript無効のページを検出: バックグラウンドのツイート詳細を解析中…');
+    debugLog('startDebugCapture', { token, tweet });
+    clearDebugCaptureTimeout();
+    state.debugCaptureTimer = setTimeout(() => {
+      if (state.debugCaptureToken !== token) return;
+      state.debugCaptureTimer = null;
+      state.debugCaptureToken = null;
+      setDebugHtml('(debug) バックグラウンドのツイートDOM取得がタイムアウトしました');
+      setStatus('デバッグタブから応答がありません (timeout)');
+      debugLog('debug capture timeout');
+      const waiter = state.debugCaptureWaiters.get(token);
+      if (waiter) {
+        state.debugCaptureWaiters.delete(token);
+        waiter.reject(new Error('debug capture timeout'));
+      }
+    }, DEBUG_CAPTURE_TIMEOUT);
+    const tab = openDebugInBackground(tweet, token);
+    if (tab) state.debugTabRef = tab;
+    state.debugOpenedBackground = true;
+    setStatus('デバッグ用にツイート詳細をバックグラウンドで開きました');
+    debugLog('debug tab opened');
+    return { token, promise };
+  }
+
+  function buildDebugUrlForTweet(tweet, token) {
+    if (!tweet) return null;
+    try {
+      const base = tweet.detailPath
+        ? new URL(tweet.detailPath, 'https://x.com')
+        : new URL(`https://x.com/${tweet.screenName}/status/${tweet.tweetId}`);
+      if (token) {
+        base.searchParams.set('xm_debug_capture', '1');
+        base.searchParams.set('xm_debug_token', token);
+      }
+      return base.toString();
+    } catch (err) {
+      console.warn('failed to build debug url', err);
+      return null;
+    }
+  }
+
+  function openDebugInBackground(tweet, token = '') {
+    const targetUrl = buildDebugUrlForTweet(tweet, token);
+    if (!targetUrl) return null;
+    try {
+      const tab = openTabForceActive(targetUrl);
+      if (!tab) setStatus('デバッグ用タブのオープンに失敗しました');
+      return tab;
+    } catch (err) {
+      console.warn('failed to open debug tab', err);
+      setStatus('デバッグ用タブのオープンに失敗しました');
+      return null;
+    }
+  }
+
+  function openTabForceActive(url) {
+    let tab = null;
+    try {
+      if (typeof GM !== 'undefined' && typeof GM.openInTab === 'function') {
+        tab = GM.openInTab(url, { active: true, insert: true, setParent: true });
+      } else if (typeof GM_openInTab === 'function') {
+        tab = GM_openInTab(url, { active: true, insert: true, setParent: true });
+      }
+    } catch (err) {
+      console.debug(LOG_PREFIX, 'GM open tab failed', err?.message || err);
+    }
+    if (!tab) {
+      const w = window.open(url, '_blank');
+      if (w) tab = w;
+    }
+    if (!tab) {
+      try { location.assign(url); } catch { /* noop */ }
+    }
+    setTimeout(() => { try { window.focus(); } catch { /* noop */ } }, 800);
+    return tab || null;
+  }
+
+  function sendDebugCaptureMessage(payload) {
+    if (!payload) return;
+    const enriched = { autoClose: true, ...payload, sentAt: Date.now() };
+    const str = JSON.stringify(enriched);
+    if (typeof GM_setValue === 'function') {
+      GM_setValue(DEBUG_CAPTURE_KEY, str);
+    }
+    try {
+      localStorage.setItem(DEBUG_CAPTURE_KEY, str);
+      setTimeout(() => {
+        try { localStorage.removeItem(DEBUG_CAPTURE_KEY); } catch { /* noop */ }
+      }, 0);
+    } catch {
+      // noop
+    }
+    if (shouldCloseDebugTabAfterSend) {
+      scheduleDebugWindowClose();
+    }
+  }
+
+  function scheduleDebugWindowClose() {
+    try {
+      console.debug(LOG_PREFIX, 'schedule debug window close');
+      setTimeout(() => {
+        try {
+          window.close();
+        } catch (err) {
+          console.debug(LOG_PREFIX, 'window.close failed', err);
+        }
+      }, 500);
+    } catch {
+      // noop
+    }
+  }
+
+  function getDebugTokenFromLocation() {
+    try {
+      const search = new URLSearchParams(location.search);
+      if (search.has('xm_debug_token')) return search.get('xm_debug_token');
+      const hash = location.hash && location.hash.startsWith('#') ? location.hash.slice(1) : location.hash;
+      if (hash) {
+        const hashParams = new URLSearchParams(hash);
+        if (hashParams.has('xm_debug_token')) return hashParams.get('xm_debug_token');
+      }
+    } catch {
+      // noop
+    }
+    return null;
+  }
+
+  async function captureTweetDomForDebug(token) {
+    if (!token) return;
+    try {
+      const group = await waitForDebugTweetGroup();
+      if (!group) throw new Error('role="group" の要素が見つかりません');
+      const timelineNodes = findTimelineConversationNodes(document);
+      const captureNodes = timelineNodes.length ? timelineNodes : [group];
+      await pumpTimeline(captureNodes);
+      let mediaReady = true;
+      for (const node of captureNodes) {
+        try {
+          await waitForMediaContent(node);
+        } catch (err) {
+          mediaReady = false;
+          debugLog('waitForMediaContent error', err?.message || err);
+        }
+      }
+      const rawParts = captureNodes.map(node => node.outerHTML || node.innerHTML || '').filter(Boolean);
+      const raw = rawParts.join('\n');
+      if (!raw) throw new Error('capture HTML を取得できませんでした');
+      const snippetSource = rawParts[0] || raw;
+      const snippet = createDebugSnippet(snippetSource);
+      sendDebugCaptureMessage({ token, raw, snippet, mediaReady });
+    } catch (err) {
+      sendDebugCaptureMessage({ token, error: err?.message || String(err) });
+    }
+  }
+
+  function waitForDebugTweetGroup(timeout = 15000) {
+    const existing = document.querySelector('div[role="group"]');
+    if (existing) return Promise.resolve(existing);
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        observer.disconnect();
+        reject(new Error('role="group" が見つかりません (timeout)'));
+      }, timeout);
+      const observer = new MutationObserver(() => {
+        const el = document.querySelector('div[role="group"]');
+        if (!el) return;
+        clearTimeout(timer);
+        observer.disconnect();
+        resolve(el);
+      });
+      observer.observe(document.documentElement, { childList: true, subtree: true });
+    });
+  }
+
+  function hasMediaNodes(root) {
+    if (!root) return false;
+    if (root.querySelector('img[src*="pbs.twimg.com/"], img[srcset*="pbs.twimg.com/"]')) return true;
+    const hasBg = Array.from(root.querySelectorAll('[style*="background-image"]')).some(el => {
+      const style = el.getAttribute('style') || '';
+      return /pbs\.twimg\.com/.test(style);
+    });
+    if (hasBg) return true;
+    if (root.querySelector('video[src*="video.twimg.com"], video source[src*="video.twimg.com"], source[src*="video.twimg.com"], a[href*="video.twimg.com"]')) return true;
+    return false;
+  }
+
+  const TIMELINE_CONV_SELECTORS = [
+    '[aria-label="タイムライン: 会話"]',
+    '[aria-label="タイムライン:会話"]',
+    '[aria-label="タイムライン：会話"]',
+    '[aria-label="タイムライン： 会話"]',
+    '[aria-label="Timeline: Conversation"]',
+    '[aria-label="Timeline: conversation"]',
+    '[aria-label="Timeline: Conversation with"]'
+  ];
+
+  function findTimelineConversationNodes(root) {
+    if (!root || typeof root.querySelectorAll !== 'function') return [];
+    const set = new Set();
+    TIMELINE_CONV_SELECTORS.forEach(sel => {
+      try {
+        root.querySelectorAll(sel).forEach(node => set.add(node));
+      } catch {
+        // ignore invalid selectors
+      }
+    });
+    if (set.size === 0) {
+      try {
+        root.querySelectorAll('[aria-label*="タイムライン"][aria-label*="会話"]').forEach(node => set.add(node));
+      } catch {
+        // noop
+      }
+    }
+    if (set.size === 0) {
+      try {
+        root.querySelectorAll('[aria-label*="Timeline"][aria-label*="Conversation"]').forEach(node => set.add(node));
+      } catch {
+        // noop
+      }
+    }
+    return Array.from(set);
+  }
+
+  function waitForMediaContent(group, timeout = 30000) {
+    if (hasMediaNodes(group)) return Promise.resolve();
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        observer.disconnect();
+        reject(new Error('メディア要素が見つかりません (timeout)'));
+        debugLog('waitForMediaContent timeout');
+      }, timeout);
+      const observer = new MutationObserver(() => {
+        if (!hasMediaNodes(group)) return;
+        clearTimeout(timer);
+        observer.disconnect();
+        resolve();
+        debugLog('waitForMediaContent resolved');
+      });
+      observer.observe(group, { childList: true, subtree: true });
+    });
+  }
+
+  async function pumpTimeline(nodes) {
+    if (!nodes || !nodes.length) return;
+    for (const node of nodes) {
+      const scroller = node.querySelector('[data-testid="primaryColumn"] [data-testid="ScrollSnap-List"]')
+        || node.querySelector('[data-testid="ScrollSnap-List"]')
+        || node;
+      for (let i = 0; i < 6; i++) {
+        try {
+          scroller.scrollTop = scroller.scrollHeight;
+          scroller.dispatchEvent(new Event('scroll', { bubbles: true }));
+        } catch { /* noop */ }
+        await sleep(250);
+      }
+    }
+  }
+
+  const debugTokenHere = getDebugTokenFromLocation();
+  const shouldCloseDebugTabAfterSend = !!debugTokenHere;
+  if (debugTokenHere) {
+    captureTweetDomForDebug(debugTokenHere);
+  }
+
+  const state = {
+    tweets: [],
+    media: [],
+    debug: false,
+    debugHtmlRaw: '',
+    debugOpenedBackground: false,
+    debugCaptureToken: null,
+    debugCaptureTimer: null,
+    debugTabRef: null,
+    debugCaptureWaiters: new Map(),
+  };
+
   /* -------------------- Collect flow -------------------- */
   let stopFlag = false;
 
-  async function onClickCollect() {
+  async function onClickCollectUrls() {
     stopFlag = false;
-    const btnCollect = document.getElementById('xm-btn-collect');
+    const btnUrl = document.getElementById('xm-btn-url');
+    const btnMedia = document.getElementById('xm-btn-media');
     const btnDownload = document.getElementById('xm-btn-download');
     const btnStop = document.getElementById('xm-btn-stop');
-    btnCollect.disabled = true; btnDownload.disabled = true; btnStop.style.display = '';
+    btnUrl.disabled = true; btnMedia.disabled = true; btnDownload.disabled = true; btnStop.style.display = '';
+    state.tweets = [];
+    renderTweetList([]);
+    setDebugHtml(state.debug ? '(debug) HTML未取得' : '');
     btnStop.onclick = () => { stopFlag = true; setStatus('停止要求…'); };
 
     try {
@@ -164,27 +666,105 @@
       const scInfo = scroller === window ? '[window]' : describeEl(scroller);
       setStatus(`スクロール対象: ${scInfo}`);
 
-      const collector = createCollector();
+      const collector = createTweetCollector();
 
       // 2) 最後までスクロール
       await autoScrollToEnd(scroller, () => collector.addFromDom(document));
 
       if (stopFlag) { setStatus('停止しました'); return; }
 
-      // 3) 全量収集→ファイル名生成→UI表示
-      const finalStats = collector.addFromDom(document); // 終了直前の表示分も拾う
-      setStatus(`全量収集中… (収集済: ${finalStats.total} 件)`);
-      const itemsRaw = collector.getItems();
-      const items = addFilenames(itemsRaw);
-      renderList(items);
-      setStatus(`収集完了: ${items.length} 件`);
-      btnDownload.disabled = false;
+      // 3) 収集結果を UI 表示
+      const finalStats = collector.addFromDom(document); // 終了前に最終スナップショット
+      setStatus(`URL収集完了: ${finalStats.total} 件`);
+      const tweets = collector.getItems();
+      state.tweets = tweets;
+      renderTweetList(tweets);
+      if (tweets.length > 0) {
+        btnMedia.disabled = false;
+      }
     } catch (e) {
       console.error(e);
       setStatus('収集中にエラー: ' + (e?.message || e));
     } finally {
       btnStop.style.display = 'none';
-      btnCollect.disabled = false;
+      btnUrl.disabled = false;
+    }
+  }
+
+  async function onClickCollectMedia() {
+    if (!state.tweets.length) {
+      setStatus('先にURL収集を実行してください');
+      return;
+    }
+
+    stopFlag = false;
+    const btnUrl = document.getElementById('xm-btn-url');
+    const btnMedia = document.getElementById('xm-btn-media');
+    const btnDownload = document.getElementById('xm-btn-download');
+    const btnStop = document.getElementById('xm-btn-stop');
+    btnUrl.disabled = true; btnMedia.disabled = true; btnDownload.disabled = true; btnStop.style.display = '';
+    state.media = [];
+    state.debugOpenedBackground = false;
+    clearDebugCaptureTimeout();
+    state.debugCaptureToken = null;
+    state.debugTabRef = null;
+    state.debugCaptureWaiters.forEach(({ reject }) => {
+      try { reject?.(new Error('debug capture reset')); } catch { /* noop */ }
+    });
+    state.debugCaptureWaiters.clear();
+    renderMediaList([]);
+    setDebugHtml(state.debug ? '(debug) HTML取得中…' : '');
+    btnStop.onclick = () => { stopFlag = true; setStatus('停止要求…'); };
+
+    try {
+      const targetTweets = state.debug ? state.tweets.slice(0, 1) : state.tweets.slice();
+      if (!targetTweets.length) {
+        setStatus('メディア取得対象のツイートがありません');
+        return;
+      }
+
+      if (state.debug) {
+        setStatus('デバッグモード: 最初の1件のみメディアを取得します');
+      }
+
+      const mediaMap = new Map();
+      for (let i = 0; i < targetTweets.length; i++) {
+        if (stopFlag) break;
+        const tweet = targetTweets[i];
+        setStatus(`メディア取得中 (${i + 1}/${targetTweets.length}): @${tweet.screenName}`);
+        try {
+          const captureHtml = state.debug && i === 0;
+          const items = await fetchTweetMedia(tweet, captureHtml);
+          debugLog('tweet media fetched', { tweetId: tweet.tweetId, count: items.length });
+          for (const item of items) {
+            const key = `${item.type}|${item.url}`;
+            if (!mediaMap.has(key)) mediaMap.set(key, item);
+          }
+        } catch (err) {
+          console.warn('メディア取得失敗', tweet, err);
+          debugLog('tweet media fetch error', err?.message || err);
+        }
+        if (i < targetTweets.length - 1 && !stopFlag) {
+          await sleep(2000);
+        }
+      }
+
+      state.media = addFilenames(Array.from(mediaMap.values()));
+      renderMediaList(state.media);
+      debugLog('mediaMap summary', { uniqueItems: mediaMap.size, rendered: state.media.length });
+      if (!stopFlag) {
+        setStatus(`メディア取得完了: ${state.media.length} 件`);
+      } else {
+        setStatus(`停止しました (取得済: ${state.media.length} 件)`);
+      }
+      btnDownload.disabled = state.media.length === 0;
+    } catch (e) {
+      console.error(e);
+      setStatus('メディア取得中にエラー: ' + (e?.message || e));
+    } finally {
+      btnStop.style.display = 'none';
+      btnUrl.disabled = false;
+      btnMedia.disabled = false;
     }
   }
 
@@ -252,8 +832,8 @@
       else scroller.scrollTop = before.scrollHeight;
 
       // フォールバック：グリッド最下段のメディアを scrollIntoView で押し込む
-      const lastMedia = findLastMediaNode();
-      if (lastMedia) lastMedia.scrollIntoView({ block: 'end', inline: 'nearest', behavior: 'auto' });
+      const lastCard = findLastTweetCard();
+      if (lastCard) lastCard.scrollIntoView({ block: 'end', inline: 'nearest', behavior: 'auto' });
 
       // 待機（ネットワーク・描画安定）
       await sleep(WAITS[Math.min(backoff, WAITS.length - 1)]);
@@ -277,139 +857,394 @@
     const sh = scroller === window
       ? (document.scrollingElement || document.documentElement).scrollHeight
       : scroller.scrollHeight;
-    return { scrollHeight: sh, count: countMediaNodes(document) };
+    return { scrollHeight: sh, count: countTweetCards(document) };
   }
 
-  function findLastMediaNode() {
-    const nodes = document.querySelectorAll(
-      'img[src*="pbs.twimg.com/media/"], a[href*="video.twimg.com"][href*=".mp4"], source[src*="video.twimg.com"][src*=".mp4"]'
-    );
+  function findLastTweetCard() {
+    const nodes = document.querySelectorAll('li[role="listitem"]');
     return nodes[nodes.length - 1] || null;
   }
 
-  function countMediaNodes(root) {
-    return root.querySelectorAll(
-      'img[src*="pbs.twimg.com/media/"], a[href*="video.twimg.com"][href*=".mp4"], source[src*="video.twimg.com"][src*=".mp4"]'
-    ).length;
+  function countTweetCards(root) {
+    return root.querySelectorAll('li[role="listitem"]').length;
   }
 
-  /* -------------------- Sweep & filenames -------------------- */
-    function sweepAllMedia(root) {
-        const items = [];
-        const seen = new Set();
-
-        // メディアグリッドの各カード（= 各画像）を走査
-        const cards = root.querySelectorAll('li[role="listitem"] a[href*="/status/"][href*="/photo/"]');
-        cards.forEach(a => {
-            const href = a.getAttribute('href') || '';
-            const meta = parseTweetPhotoMetaFromHref(href); // screenName, tweetId, photoIndex
-
-            // 画像URLは <img> の src または 背景画像 style から取得
-            let imgUrl =
-                a.querySelector('img[src*="pbs.twimg.com/media/"]')?.src ||
-                extractBgUrl(a.querySelector('[style*="background-image"]')?.getAttribute('style'));
-
-            if (!imgUrl) return; // 画像見つからないカードはスキップ
-
-            imgUrl = normalizeImageUrl(imgUrl); // ?name=orig へ
-            if (!imgUrl) return;
-
-            // 重複排除（メディアID or 完整形URLで）
-            if (seen.has(imgUrl)) return;
-            seen.add(imgUrl);
-
-            items.push({
-                type: 'img',
-                url: imgUrl,
-                meta: {
-                    screenName: meta.screenName,
-                    tweetId: meta.tweetId,
-                    // 同一ツイート内の順序は photoIndex で持てる（のちの②対応に使う）
-                    photoIndex: meta.photoIndex
-                }
-            });
-        });
-
-        return items;
-    }
-
-  function createCollector() {
-    const collected = new Map();
+  /* -------------------- Tweet URL collection -------------------- */
+  function createTweetCollector() {
+    const tweets = new Map();
     return {
       addFromDom(root) {
-        const snapshot = sweepAllMedia(root);
-        let added = 0;
-        for (const item of snapshot) {
-          if (collected.has(item.url)) continue;
-          collected.set(item.url, item);
-          added++;
-        }
-        return { added, total: collected.size };
+        const added = collectTweetUrls(root, tweets);
+        return { added, total: tweets.size };
       },
       getItems() {
-        return Array.from(collected.values());
+        return Array.from(tweets.values());
       }
     };
   }
-    // ▼ href="/<sn>/status/<id>/photo/<n>" からメタを抜く
-    function parseTweetPhotoMetaFromHref(href) {
-        // 例: /ysaito_human/status/1961381692951691766/photo/1
-        const m = href.match(/^\/([^/]+)\/status\/(\d+)\/photo\/(\d+)/);
-        if (!m) return { screenName: undefined, tweetId: undefined, photoIndex: undefined };
-        return { screenName: m[1], tweetId: m[2], photoIndex: Number(m[3]) };
+
+  function collectTweetUrls(root, store) {
+    let added = 0;
+    const cards = root.querySelectorAll('li[role="listitem"]');
+    cards.forEach(card => {
+      const info = extractTweetFromCard(card);
+      if (!info) return;
+      if (!store.has(info.key)) {
+        store.set(info.key, info);
+        added++;
+      }
+    });
+    return added;
+  }
+
+  function extractTweetFromCard(card) {
+    if (!card) return null;
+    const hints = analyzeMediaHints(card);
+    if (!hints.hasMedia) return null;
+
+    const anchor = findStatusAnchor(card);
+    if (!anchor) return null;
+    const info = parseTweetFromHref(anchor.getAttribute('href') || '');
+    if (!info) return null;
+
+    const summary = summarizeMediaHints(hints);
+    const detailPath = anchor.getAttribute('href') || '';
+    return {
+      key: `${info.screenName}:${info.tweetId}`,
+      screenName: info.screenName,
+      tweetId: info.tweetId,
+      url: `https://x.com/${info.screenName}/status/${info.tweetId}`,
+      detailPath,
+      mediaSummary: summary,
+      hints
+    };
+  }
+
+  function findStatusAnchor(card) {
+    const anchors = card.querySelectorAll('a[href*="/status/"]');
+    let fallback = null;
+    for (const anchor of anchors) {
+      const href = anchor.getAttribute('href') || '';
+      if (!href.startsWith('/')) continue;
+      const parsed = parseTweetFromHref(href);
+      if (!parsed) continue;
+      if (!fallback) fallback = anchor;
+      if (!/\/(photo|video)\//.test(href)) {
+        return anchor;
+      }
     }
-    // ▼ background-image: url("...") からURLを取り出す
-    function extractBgUrl(styleText) {
-        if (!styleText) return null;
-        const m = styleText.match(/background-image:\s*url\((['"]?)(.*?)\1\)/i);
-        return m ? m[2] : null;
+    return fallback;
+  }
+
+  function parseTweetFromHref(href) {
+    if (!href) return null;
+    const m = href.match(/^\/([^/?#]+)\/status\/(\d+)/);
+    if (!m) return null;
+    return { screenName: m[1], tweetId: m[2] };
+  }
+
+  function analyzeMediaHints(card) {
+    const hasPhoto = !!(card.querySelector('a[href*="/photo/"]') || card.querySelector('img[src*="pbs.twimg.com/"]'));
+    const hasVideo = !!(card.querySelector('a[href*="/video/"]') || card.querySelector('video, source[src*="video.twimg.com"]'));
+    const iconPath = card.querySelector('a[href*="/status/"] svg path');
+    const pathD = iconPath?.getAttribute('d') || '';
+    const isMulti = /M2\s*8\.5C2\s*7\.12/.test(pathD) || pathD.includes('19.5 4');
+    return {
+      hasMedia: hasPhoto || hasVideo,
+      hasPhoto,
+      hasVideo,
+      isMulti
+    };
+  }
+
+  function summarizeMediaHints(hints) {
+    if (!hints?.hasMedia) return '';
+    const parts = [];
+    if (hints.hasPhoto) parts.push('photo');
+    if (hints.hasVideo) parts.push('video');
+    let summary = parts.join('+') || 'media';
+    if (hints.isMulti) summary = `multi-${summary}`;
+    return summary;
+  }
+
+  async function fetchTweetMedia(tweet, captureHtml = false) {
+    const endpoints = [];
+    if (tweet.detailPath) {
+      try {
+        const detailUrl = ensurePrefetchParam(new URL(tweet.detailPath, 'https://x.com').toString());
+        endpoints.push(detailUrl);
+      } catch {
+        // ignore invalid detailPath
+      }
     }
+    const baseStatus = ensurePrefetchParam(`https://x.com/${tweet.screenName}/status/${tweet.tweetId}`);
+    if (!endpoints.includes(baseStatus)) endpoints.push(baseStatus);
+    const fallback = ensurePrefetchParam(`https://x.com/i/web/status/${tweet.tweetId}`);
+    if (!endpoints.includes(fallback)) endpoints.push(fallback);
+    let html = null;
+    for (const url of endpoints) {
+      try {
+        const resp = await fetch(url, {
+          credentials: 'include',
+          headers: {
+            'x-twitter-active-user': 'yes',
+            'x-twitter-client-language': navigator.language || 'en'
+          }
+        });
+        if (resp.ok) {
+          html = await resp.text();
+          break;
+        }
+      } catch (err) {
+        console.warn('tweet fetch failed', url, err);
+      }
+    }
+    if (!html) {
+      if (captureHtml) setDebugHtml('(debug) HTML取得に失敗しました');
+      return [];
+    }
+
+    const parser = new DOMParser();
+    const doc = parser.parseFromString(html, 'text/html');
+    if (!doc) {
+      if (captureHtml) setDebugHtml('(debug) HTML のパースに失敗しました');
+      return [];
+    }
+
+    const looksDisabled = /JavaScriptを使用できません/.test(html) || html.includes('id="ScriptLoadFailure"');
+    if (looksDisabled) {
+      try {
+        const capture = startDebugCapture(tweet);
+        if (capture?.promise) {
+          const captureResult = await capture.promise;
+          const rawGroupHtml = (captureResult && typeof captureResult === 'object') ? (captureResult.raw || '') : (captureResult || '');
+          const mediaReadyFlag = (captureResult && typeof captureResult === 'object') ? captureResult.mediaReady : undefined;
+          if (rawGroupHtml) {
+            debugLog('processing debug HTML from capture', { length: rawGroupHtml.length, mediaReady: mediaReadyFlag });
+            const fromDebug = collectMediaFromDebugHtml(rawGroupHtml, tweet);
+            debugLog('media collected from debug HTML', { count: fromDebug.length });
+            if (fromDebug.length) {
+              setStatus(`デバッグHTMLからメディアを取得 (${fromDebug.length} 件)`);
+              return fromDebug;
+            }
+            if (mediaReadyFlag === false) {
+              setStatus('デバッグHTML受信済み: メディア要素が見つかりませんでした (タイムアウト)');
+            } else {
+              setStatus('デバッグHTMLを解析しましたがメディアが見つかりませんでした');
+            }
+          }
+        } else {
+          setDebugHtml('(debug) バックグラウンドのツイート詳細からHTML取得待ちです…', html);
+          debugLog('waiting for debug capture (promise missing)');
+        }
+      } catch (err) {
+        console.warn('debug capture flow failed', err);
+        debugLog('debug capture flow failed', err?.message || err);
+      }
+      return [];
+    }
+
+    if (captureHtml) {
+      const group = doc.querySelector('div[role="group"]');
+      if (group) {
+        const htmlStr = group.outerHTML || group.innerHTML || '';
+        const snippet = createDebugSnippet(htmlStr);
+        clearDebugCaptureTimeout();
+        state.debugCaptureToken = null;
+        setDebugHtml(snippet, htmlStr);
+        debugLog('using inline tweet HTML', { length: htmlStr.length });
+      } else {
+        setDebugHtml('(debug) role="group" の要素が見つかりませんでした', html);
+        debugLog('role="group" not found in inline HTML');
+      }
+    }
+
+    const collected = collectMediaFromDoc(doc, tweet);
+    debugLog('media collected from inline document', { count: collected.length });
+    return collected;
+  }
+
+  function collectMediaFromDebugHtml(html, tweet) {
+    if (!html) return [];
+    try {
+      const tmpDoc = document.implementation.createHTMLDocument('xm-debug');
+      tmpDoc.body.innerHTML = html;
+      const items = collectMediaFromDoc(tmpDoc, tweet);
+      debugLog('collectMediaFromDebugHtml result', { count: items.length });
+      return items;
+    } catch (err) {
+      console.warn('collectMediaFromDebugHtml failed', err);
+      debugLog('collectMediaFromDebugHtml failed', err?.message || err);
+      return [];
+    }
+  }
+
+  function findArticleForTweet(doc, tweetId) {
+    const selector = `article a[href*="/status/${tweetId}"]`;
+    const anchor = doc.querySelector(selector);
+    return anchor?.closest('article') || null;
+  }
+
+  function ensurePrefetchParam(url) {
+    try {
+      const u = new URL(url);
+      if (!u.searchParams.has('prefetch')) {
+        u.searchParams.set('prefetch', '1');
+      }
+      return u.toString();
+    } catch {
+      return url;
+    }
+  }
+
+  function collectMediaFromArticle(article, tweet) {
+    const items = [];
+    const seen = new Set();
+
+    const pushItem = (type, rawUrl, meta = {}) => {
+      const normalized = type === 'img' ? normalizeImageUrl(rawUrl) : normalizeVideoUrl(rawUrl);
+      if (!normalized) return;
+      const key = `${type}|${normalized}`;
+      if (seen.has(key)) return;
+      seen.add(key);
+      items.push({
+        type,
+        url: normalized,
+        tweetId: tweet.tweetId,
+        screenName: tweet.screenName,
+        meta
+      });
+    };
+
+    if (!article) return items;
+
+    const photoBlocks = article.querySelectorAll('[data-testid="tweetPhoto"], div[aria-label="画像"], div[aria-label="Image"]');
+    photoBlocks.forEach(block => {
+      block.querySelectorAll('img').forEach(img => {
+        const raw = img.currentSrc || img.src || img.getAttribute('src');
+        if (!raw) return;
+        pushItem('img', raw);
+      });
+      block.querySelectorAll('[style*="background-image"]').forEach(el => {
+        const style = el.getAttribute('style') || '';
+        const match = style.match(/background-image:\s*url\((['"]?)(.*?)\1\)/i);
+        if (match) pushItem('img', match[2]);
+      });
+    });
+
+    article.querySelectorAll('img[src*="pbs.twimg.com/"]').forEach(img => {
+      const raw = img.currentSrc || img.src || img.getAttribute('src');
+      if (!raw) return;
+      pushItem('img', raw);
+    });
+
+    article.querySelectorAll('video, source[src*="video.twimg.com"], a[href*="video.twimg.com"]').forEach(node => {
+      let raw = null;
+      if (node.tagName === 'VIDEO') raw = node.currentSrc || node.src || node.getAttribute('src');
+      else if (node.tagName === 'SOURCE') raw = node.src || node.getAttribute('src');
+      else if (node.tagName === 'A') raw = node.href || node.getAttribute('href');
+      if (!raw) return;
+      pushItem('mp4', raw);
+    });
+
+    return items;
+  }
+
+  function collectMediaFromDoc(doc, tweet) {
+    const aggregate = new Map();
+    const addFromArticle = (article, label) => {
+      if (!article) return;
+      const items = collectMediaFromArticle(article, tweet);
+      debugLog('collectMediaFromArticle', { label, count: items.length });
+      for (const item of items) {
+        const key = `${item.type}|${item.url}`;
+        if (!aggregate.has(key)) aggregate.set(key, item);
+      }
+    };
+
+    const primaryArticle = findArticleForTweet(doc, tweet.tweetId);
+    if (primaryArticle) addFromArticle(primaryArticle, 'primary');
+
+    if (aggregate.size === 0) {
+      const timelineNodes = findTimelineConversationNodes(doc);
+      timelineNodes.forEach((node, idx) => {
+        const article = node.querySelector(`article a[href*="/status/${tweet.tweetId}"]`)?.closest('article');
+        if (article) addFromArticle(article, `timeline-${idx}`);
+      });
+    }
+
+    if (aggregate.size === 0 && doc !== document) {
+      addFromArticle(doc.querySelector(`article a[href*="/status/${tweet.tweetId}"]`)?.closest('article'), 'fallback-doc');
+    }
+
+    if (aggregate.size === 0) {
+      addFromArticle(doc, 'document');
+    }
+
+    return Array.from(aggregate.values());
+  }
 
   function normalizeImageUrl(u) {
     try {
-      const url = new URL(u);
-      if (!/pbs\.twimg\.com\/media\//.test(url.href)) return null;
+      const url = new URL(u, location.origin);
+      if (!/pbs\.twimg\.com/.test(url.hostname)) return null;
+      const pathname = url.pathname || '';
+      const allowed = /\/media\//.test(pathname) || /\/tweet_video\//.test(pathname) || /\/amplify-video\//.test(pathname) || /\/ext_tw_video\//.test(pathname) || /\/card_img\//.test(pathname);
+      if (!allowed) return null;
       url.searchParams.set('name', 'orig');
       if (!url.searchParams.has('format') && !/\.(jpg|png|webp)$/i.test(url.pathname)) {
         url.searchParams.set('format', 'jpg');
       }
       return url.toString();
-    } catch { return null; }
+    } catch {
+      return null;
+    }
   }
 
-  function pickMeta(el) {
-    const article = el.closest('article');
-    let tweetId, screenName;
-    const a = article && article.querySelector('a[href*="/status/"]');
-    if (a) {
-      const m = a.getAttribute('href')?.match(/\/([^\/]+)\/status\/(\d+)/);
-      if (m) { screenName = m[1]; tweetId = m[2]; }
+  function normalizeVideoUrl(u) {
+    try {
+      const url = new URL(u, location.origin);
+      if (!/video\.twimg\.com$/i.test(url.hostname) && !/\.video\.twimg\.com$/i.test(url.hostname)) return null;
+      if (!/\.mp4$/i.test(url.pathname)) return null;
+      return url.toString();
+    } catch {
+      return null;
     }
-    return { tweetId, screenName };
   }
 
   function addFilenames(items) {
-    // {screenName}_{tweetId}_{index}.{ext}
     const counter = new Map();
-    return items.map(it => {
-      const sn = it.meta?.screenName || 'unknown';
-      const tid = it.meta?.tweetId || 'na';
-      const key = `${sn}:${tid}`;
-      const cur = (counter.get(key) || 0) + 1; counter.set(key, cur);
-      const ext = guessExt(it);
-      return { ...it, filename: `${sn}_${tid}_${String(cur).padStart(2,'0')}.${ext}` };
+    return items.map(item => {
+      const key = `${item.screenName}:${item.tweetId}`;
+      const set = counter.get(key) || { next: 1, used: new Set() };
+      const index = set.next;
+      set.used.add(index);
+      set.next += 1;
+      counter.set(key, set);
+      const ext = guessExt(item.type, item.url);
+      const filename = `${item.screenName}_${item.tweetId}_${String(index).padStart(2, '0')}.${ext}`;
+      return { ...item, filename };
     });
   }
-  function guessExt(it) {
+
+  function guessExt(type, url) {
+    if (type === 'mp4') return 'mp4';
     try {
-      const u = new URL(it.url);
-      if (it.type === 'mp4') return 'mp4';
-      const fmt = u.searchParams.get('format'); if (fmt) return sanitizeExt(fmt);
-      const m = u.pathname.match(/\.(jpg|jpeg|png|webp)$/i); if (m) return sanitizeExt(m[1]);
-      return 'jpg';
-    } catch { return it.type === 'mp4' ? 'mp4' : 'jpg'; }
+      const u = new URL(url);
+      const fmt = u.searchParams.get('format');
+      if (fmt) return sanitizeExt(fmt);
+      const match = u.pathname.match(/\.(jpg|jpeg|png|webp)$/i);
+      if (match) return sanitizeExt(match[1]);
+    } catch {
+      // noop
+    }
+    return 'jpg';
   }
-  const sanitizeExt = (e) => (e || '').toLowerCase() === 'jpeg' ? 'jpg' : (e || '').toLowerCase();
+
+  function sanitizeExt(ext) {
+    const lower = (ext || '').toLowerCase();
+    return lower === 'jpeg' ? 'jpg' : lower;
+  }
   const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
   /* -------------------- Boot -------------------- */
