@@ -2,6 +2,23 @@
 
 Tampermonkey 向けに開発された、X（旧 Twitter）のプロフィール「メディア」タブで投稿単位のメディアを収集・一括ダウンロードするユーザースクリプトです。今後の実装は「URL 収集 → メディア解析 → ZIP ダウンロード」の 3 段階に整理されています。
 
+## インストール
+
+1. Tampermonkey をブラウザにインストールします。
+2. 次の raw URL をブラウザで開きます。
+   - `https://github.com/japan4415/x-photo-video-collector-tempermonkey/raw/main/x-photo-video-collector.user.js`
+3. Tampermonkey のインストール画面が開いたら、そのままインストールします。
+
+この方法でインストールした場合、以後は `@updateURL` / `@downloadURL` により自動更新を受け取れます。
+
+## 自動更新について
+
+- 配布ファイルは `x-photo-video-collector.user.js` です。
+- GitHub `main` 上の raw URL を `@updateURL` / `@downloadURL` に設定しています。
+- 更新を配布する際はユーザースクリプトヘッダの `@version` を上げてください。
+- すでにコードをコピーペーストして登録している場合、自動更新は有効になりません。上記 raw URL から再インストールしてください。
+- Tampermonkey のダッシュボードから `Check for userscript updates` でも更新確認できます。
+
 ## 概要
 
 - 対象ページ: `https://x.com/<screenName>/media`

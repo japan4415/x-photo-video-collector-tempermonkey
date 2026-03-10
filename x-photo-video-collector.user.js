@@ -1,13 +1,15 @@
 // ==UserScript==
-// @name         X Profile Media UI (Top-right Panel) - Solid AutoScroll & List
-// @namespace    your-namespace
-// @version      0.4.0
-// @description  On x.com/<user>/media: robust auto-scroll (detects real scroller, with scrollIntoView fallback), then list filenames (IMG + MP4; no m3u8).
+// @name         X Photo Video Collector
+// @namespace    https://github.com/japan4415/x-photo-video-collector-tempermonkey
+// @version      0.4.1
+// @description  Collect media post URLs and direct image/mp4 links from X profile media tabs.
 // @match        https://x.com/*
 // @run-at       document-idle
 // @grant        GM_openInTab
 // @grant        GM_setValue
 // @grant        GM_addValueChangeListener
+// @updateURL    https://github.com/japan4415/x-photo-video-collector-tempermonkey/raw/main/x-photo-video-collector.user.js
+// @downloadURL  https://github.com/japan4415/x-photo-video-collector-tempermonkey/raw/main/x-photo-video-collector.user.js
 // @noframes
 // ==/UserScript==
 
