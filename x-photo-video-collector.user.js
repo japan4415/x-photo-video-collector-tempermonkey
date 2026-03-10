@@ -1,13 +1,17 @@
 // ==UserScript==
 // @name         X Photo Video Collector
 // @namespace    https://github.com/japan4415/x-photo-video-collector-tempermonkey
-// @version      0.4.1
+// @version      0.5.0
 // @description  Collect media post URLs and direct image/mp4 links from X profile media tabs.
 // @match        https://x.com/*
 // @run-at       document-idle
 // @grant        GM_openInTab
 // @grant        GM_setValue
 // @grant        GM_addValueChangeListener
+// @grant        GM_xmlhttpRequest
+// @connect      pbs.twimg.com
+// @connect      video.twimg.com
+// @connect      *.video.twimg.com
 // @updateURL    https://github.com/japan4415/x-photo-video-collector-tempermonkey/raw/main/x-photo-video-collector.user.js
 // @downloadURL  https://github.com/japan4415/x-photo-video-collector-tempermonkey/raw/main/x-photo-video-collector.user.js
 // @noframes
@@ -20,7 +24,17 @@
   const DEBUG_CAPTURE_TIMEOUT = 45000;
   const DEBUG_SNIPPET_LIMIT = 8000;
   const LOG_PREFIX = '[xm-debug]';
+  const ZIP_LOCAL_FILE_HEADER_SIG = 0x04034b50;
+  const ZIP_CENTRAL_DIRECTORY_SIG = 0x02014b50;
+  const ZIP_END_OF_CENTRAL_DIRECTORY_SIG = 0x06054b50;
+  const ZIP_STORE_METHOD = 0;
+  const ZIP_VERSION_NEEDED = 20;
+  const ZIP_UTF8_FLAG = 0x0800;
+  const ZIP_MAX_UINT32 = 0xffffffff;
+  const ZIP_MAX_ENTRIES = 0xffff;
+  const utf8Encoder = new TextEncoder();
   let debugBridgeInitialized = false;
+  let activeDownloadAbort = null;
 
   /* -------------------- Visibility shim -------------------- */
   (function ensureVisibleEnvironment() {
@@ -142,7 +156,7 @@
     document.body.appendChild(panel);
     document.getElementById('xm-btn-url').addEventListener('click', onClickCollectUrls);
     document.getElementById('xm-btn-media').addEventListener('click', onClickCollectMedia);
-    document.getElementById('xm-btn-download').addEventListener('click', () => setStatus('ZIP ダウンロードは未実装です'));
+    document.getElementById('xm-btn-download').addEventListener('click', onClickDownloadZip);
     const debugToggle = document.getElementById('xm-debug-toggle');
     if (debugToggle) {
       debugToggle.checked = state.debug;
@@ -770,6 +784,85 @@
     }
   }
 
+  async function onClickDownloadZip() {
+    if (!state.media.length) {
+      setStatus('先にメディア取得を実行してください');
+      return;
+    }
+
+    stopFlag = false;
+    const btnUrl = document.getElementById('xm-btn-url');
+    const btnMedia = document.getElementById('xm-btn-media');
+    const btnDownload = document.getElementById('xm-btn-download');
+    const btnStop = document.getElementById('xm-btn-stop');
+    btnUrl.disabled = true; btnMedia.disabled = true; btnDownload.disabled = true; btnStop.style.display = '';
+    btnStop.onclick = () => {
+      stopFlag = true;
+      abortActiveDownload();
+      setStatus('停止要求…');
+    };
+
+    let successCount = 0;
+    let failedCount = 0;
+
+    try {
+      const entries = [];
+      const archiveName = buildArchiveFilename(state.media);
+      for (let i = 0; i < state.media.length; i++) {
+        if (stopFlag) break;
+        const item = state.media[i];
+        const ordinal = `${i + 1}/${state.media.length}`;
+        setStatus(`ZIP取得中 (${ordinal}): ${item.filename} 成功=${successCount} 失敗=${failedCount}`);
+        try {
+          const bytes = await downloadMediaBytes(item, ({ loaded, total }) => {
+            const progressText = total ? `${formatBytes(loaded)} / ${formatBytes(total)}` : `${formatBytes(loaded)}`;
+            setStatus(`ZIP取得中 (${ordinal}): ${item.filename} ${progressText} 成功=${successCount} 失敗=${failedCount}`);
+          });
+          entries.push({ filename: item.filename, bytes, modifiedAt: Date.now() });
+          successCount += 1;
+        } catch (err) {
+          if (stopFlag && isAbortError(err)) break;
+          failedCount += 1;
+          console.warn('ZIP media download failed', item, err);
+          setStatus(`ZIP取得失敗 (${ordinal}): ${item.filename} 成功=${successCount} 失敗=${failedCount}`);
+        }
+        await sleep(0);
+      }
+
+      if (stopFlag) {
+        setStatus(`停止しました (ZIP未生成: 成功=${successCount} 失敗=${failedCount})`);
+        return;
+      }
+
+      if (!entries.length) {
+        setStatus(`ZIP生成対象がありません (失敗=${failedCount})`);
+        return;
+      }
+
+      const zipBlob = await buildStoredZip(entries, ({ index, total, filename }) => {
+        setStatus(`ZIP生成中 (${index}/${total}): ${filename} 成功=${successCount} 失敗=${failedCount}`);
+      });
+      triggerBlobDownload(zipBlob, archiveName);
+      const summary = failedCount > 0
+        ? `ZIPダウンロード準備完了: ${archiveName} (成功=${successCount} 失敗=${failedCount})`
+        : `ZIPダウンロード準備完了: ${archiveName} (${successCount} 件)`;
+      setStatus(summary);
+    } catch (e) {
+      if (stopFlag && isAbortError(e)) {
+        setStatus(`停止しました (ZIP未生成: 成功=${successCount} 失敗=${failedCount})`);
+      } else {
+        console.error(e);
+        setStatus('ZIP生成中にエラー: ' + (e?.message || e));
+      }
+    } finally {
+      abortActiveDownload();
+      btnStop.style.display = 'none';
+      btnUrl.disabled = false;
+      btnMedia.disabled = false;
+      btnDownload.disabled = state.media.length === 0;
+    }
+  }
+
   /* -------------------- Robust auto-scroll -------------------- */
 
   // 1) スクロールコンテナ自動検出
@@ -1247,6 +1340,296 @@
     const lower = (ext || '').toLowerCase();
     return lower === 'jpeg' ? 'jpg' : lower;
   }
+
+  async function downloadMediaBytes(item, onProgress) {
+    if (typeof GM_xmlhttpRequest === 'function') {
+      return downloadMediaBytesViaGm(item, onProgress);
+    }
+    return downloadMediaBytesViaFetch(item, onProgress);
+  }
+
+  function downloadMediaBytesViaGm(item, onProgress) {
+    return new Promise((resolve, reject) => {
+      let settled = false;
+      let req = null;
+      const abort = () => {
+        try { req?.abort(); } catch { /* noop */ }
+      };
+      activeDownloadAbort = abort;
+
+      const finalize = (fn) => (value) => {
+        if (settled) return;
+        settled = true;
+        if (activeDownloadAbort === abort) activeDownloadAbort = null;
+        fn(value);
+      };
+
+      req = GM_xmlhttpRequest({
+        method: 'GET',
+        url: item.url,
+        responseType: 'arraybuffer',
+        onprogress: (event) => {
+          if (stopFlag) {
+            abort();
+            return;
+          }
+          onProgress?.({ loaded: event.loaded || 0, total: event.total || 0 });
+        },
+        onload: finalize((resp) => {
+          const status = Number(resp?.status || 0);
+          if (status < 200 || status >= 300) {
+            reject(new Error(`HTTP ${status || 'error'}`));
+            return;
+          }
+          const response = resp?.response;
+          if (!(response instanceof ArrayBuffer)) {
+            reject(new Error('arraybuffer response is unavailable'));
+            return;
+          }
+          resolve(new Uint8Array(response));
+        }),
+        onabort: finalize(() => reject(createAbortError())),
+        onerror: finalize(() => reject(new Error('network error'))),
+        ontimeout: finalize(() => reject(new Error('timeout'))),
+      });
+    });
+  }
+
+  async function downloadMediaBytesViaFetch(item, onProgress) {
+    const controller = new AbortController();
+    const abort = () => controller.abort();
+    activeDownloadAbort = abort;
+    try {
+      const resp = await fetch(item.url, {
+        method: 'GET',
+        mode: 'cors',
+        credentials: 'omit',
+        signal: controller.signal,
+      });
+      if (!resp.ok) {
+        throw new Error(`HTTP ${resp.status}`);
+      }
+      if (!resp.body) {
+        const buffer = await resp.arrayBuffer();
+        return new Uint8Array(buffer);
+      }
+      const total = Number(resp.headers.get('content-length') || 0);
+      const reader = resp.body.getReader();
+      const chunks = [];
+      let loaded = 0;
+      while (true) {
+        if (stopFlag) controller.abort();
+        const { done, value } = await reader.read();
+        if (done) break;
+        chunks.push(value);
+        loaded += value.byteLength;
+        onProgress?.({ loaded, total });
+      }
+      const merged = new Uint8Array(loaded);
+      let offset = 0;
+      for (const chunk of chunks) {
+        merged.set(chunk, offset);
+        offset += chunk.byteLength;
+      }
+      return merged;
+    } catch (err) {
+      if (err?.name === 'AbortError') throw createAbortError();
+      throw err;
+    } finally {
+      if (activeDownloadAbort === abort) activeDownloadAbort = null;
+    }
+  }
+
+  async function buildStoredZip(entries, onProgress) {
+    if (entries.length > ZIP_MAX_ENTRIES) {
+      throw new Error('ZIP64 未対応のため、ファイル数が多すぎます');
+    }
+
+    const fileParts = [];
+    const centralParts = [];
+    let offset = 0;
+    let centralSize = 0;
+
+    for (let i = 0; i < entries.length; i++) {
+      if (stopFlag) throw createAbortError();
+      const entry = entries[i];
+      onProgress?.({ index: i + 1, total: entries.length, filename: entry.filename });
+      const nameBytes = utf8Encoder.encode(entry.filename);
+      const bytes = entry.bytes instanceof Uint8Array ? entry.bytes : new Uint8Array(entry.bytes);
+      const { dosDate, dosTime } = toDosDateTime(entry.modifiedAt);
+      const crc = crc32(bytes);
+      const localHeader = createLocalFileHeader(nameBytes, bytes.byteLength, crc, dosTime, dosDate);
+      const centralHeader = createCentralDirectoryHeader(nameBytes, bytes.byteLength, crc, dosTime, dosDate, offset);
+      const entrySize = localHeader.byteLength + nameBytes.byteLength + bytes.byteLength;
+
+      if (offset + entrySize > ZIP_MAX_UINT32) {
+        throw new Error('ZIP64 未対応のため、ZIP サイズが大きすぎます');
+      }
+
+      fileParts.push(localHeader, nameBytes, bytes);
+      centralParts.push(centralHeader, nameBytes);
+      offset += entrySize;
+      centralSize += centralHeader.byteLength + nameBytes.byteLength;
+
+      if ((i + 1) % 10 === 0) await sleep(0);
+    }
+
+    if (offset + centralSize > ZIP_MAX_UINT32) {
+      throw new Error('ZIP64 未対応のため、ZIP サイズが大きすぎます');
+    }
+
+    const eocd = createEndOfCentralDirectory(entries.length, centralSize, offset);
+    return new Blob([...fileParts, ...centralParts, eocd], { type: 'application/zip' });
+  }
+
+  function createLocalFileHeader(nameBytes, size, crc, dosTime, dosDate) {
+    const header = new ArrayBuffer(30);
+    const view = new DataView(header);
+    view.setUint32(0, ZIP_LOCAL_FILE_HEADER_SIG, true);
+    view.setUint16(4, ZIP_VERSION_NEEDED, true);
+    view.setUint16(6, ZIP_UTF8_FLAG, true);
+    view.setUint16(8, ZIP_STORE_METHOD, true);
+    view.setUint16(10, dosTime, true);
+    view.setUint16(12, dosDate, true);
+    view.setUint32(14, crc, true);
+    view.setUint32(18, size, true);
+    view.setUint32(22, size, true);
+    view.setUint16(26, nameBytes.byteLength, true);
+    view.setUint16(28, 0, true);
+    return new Uint8Array(header);
+  }
+
+  function createCentralDirectoryHeader(nameBytes, size, crc, dosTime, dosDate, localHeaderOffset) {
+    const header = new ArrayBuffer(46);
+    const view = new DataView(header);
+    view.setUint32(0, ZIP_CENTRAL_DIRECTORY_SIG, true);
+    view.setUint16(4, ZIP_VERSION_NEEDED, true);
+    view.setUint16(6, ZIP_VERSION_NEEDED, true);
+    view.setUint16(8, ZIP_UTF8_FLAG, true);
+    view.setUint16(10, ZIP_STORE_METHOD, true);
+    view.setUint16(12, dosTime, true);
+    view.setUint16(14, dosDate, true);
+    view.setUint32(16, crc, true);
+    view.setUint32(20, size, true);
+    view.setUint32(24, size, true);
+    view.setUint16(28, nameBytes.byteLength, true);
+    view.setUint16(30, 0, true);
+    view.setUint16(32, 0, true);
+    view.setUint16(34, 0, true);
+    view.setUint16(36, 0, true);
+    view.setUint32(38, 0, true);
+    view.setUint32(42, localHeaderOffset, true);
+    return new Uint8Array(header);
+  }
+
+  function createEndOfCentralDirectory(entryCount, centralSize, centralOffset) {
+    const footer = new ArrayBuffer(22);
+    const view = new DataView(footer);
+    view.setUint32(0, ZIP_END_OF_CENTRAL_DIRECTORY_SIG, true);
+    view.setUint16(4, 0, true);
+    view.setUint16(6, 0, true);
+    view.setUint16(8, entryCount, true);
+    view.setUint16(10, entryCount, true);
+    view.setUint32(12, centralSize, true);
+    view.setUint32(16, centralOffset, true);
+    view.setUint16(20, 0, true);
+    return new Uint8Array(footer);
+  }
+
+  function triggerBlobDownload(blob, filename) {
+    const blobUrl = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = blobUrl;
+    a.download = filename;
+    a.style.display = 'none';
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(blobUrl), 60_000);
+  }
+
+  function buildArchiveFilename(items) {
+    const first = items[0];
+    const screenName = sanitizeArchiveSegment(first?.screenName || getScreenNameFromPath() || 'x_media');
+    return `${screenName}_media_${formatTimestamp(new Date())}.zip`;
+  }
+
+  function sanitizeArchiveSegment(value) {
+    return String(value || 'x_media').replace(/[^a-zA-Z0-9_-]+/g, '_').replace(/^_+|_+$/g, '') || 'x_media';
+  }
+
+  function getScreenNameFromPath() {
+    const match = location.pathname.match(/^\/([^/]+)\/media\/?$/);
+    return match ? match[1] : '';
+  }
+
+  function formatTimestamp(date) {
+    const year = date.getFullYear();
+    const month = String(date.getMonth() + 1).padStart(2, '0');
+    const day = String(date.getDate()).padStart(2, '0');
+    const hour = String(date.getHours()).padStart(2, '0');
+    const minute = String(date.getMinutes()).padStart(2, '0');
+    const second = String(date.getSeconds()).padStart(2, '0');
+    return `${year}${month}${day}_${hour}${minute}${second}`;
+  }
+
+  function formatBytes(bytes) {
+    if (!bytes) return '0 B';
+    const units = ['B', 'KB', 'MB', 'GB'];
+    let value = bytes;
+    let unitIndex = 0;
+    while (value >= 1024 && unitIndex < units.length - 1) {
+      value /= 1024;
+      unitIndex += 1;
+    }
+    const digits = value >= 10 || unitIndex === 0 ? 0 : 1;
+    return `${value.toFixed(digits)} ${units[unitIndex]}`;
+  }
+
+  function createAbortError() {
+    const err = new Error('download aborted');
+    err.name = 'AbortError';
+    return err;
+  }
+
+  function isAbortError(err) {
+    return err?.name === 'AbortError';
+  }
+
+  function abortActiveDownload() {
+    if (typeof activeDownloadAbort !== 'function') return;
+    try { activeDownloadAbort(); } catch { /* noop */ }
+    activeDownloadAbort = null;
+  }
+
+  function toDosDateTime(value) {
+    const date = value ? new Date(value) : new Date();
+    const year = Math.max(1980, date.getFullYear());
+    const dosDate = ((year - 1980) << 9) | ((date.getMonth() + 1) << 5) | date.getDate();
+    const dosTime = (date.getHours() << 11) | (date.getMinutes() << 5) | Math.floor(date.getSeconds() / 2);
+    return { dosDate, dosTime };
+  }
+
+  const CRC32_TABLE = (() => {
+    const table = new Uint32Array(256);
+    for (let i = 0; i < 256; i++) {
+      let c = i;
+      for (let bit = 0; bit < 8; bit++) {
+        c = (c & 1) ? (0xedb88320 ^ (c >>> 1)) : (c >>> 1);
+      }
+      table[i] = c >>> 0;
+    }
+    return table;
+  })();
+
+  function crc32(bytes) {
+    let c = 0xffffffff;
+    for (let i = 0; i < bytes.length; i++) {
+      c = CRC32_TABLE[(c ^ bytes[i]) & 0xff] ^ (c >>> 8);
+    }
+    return (c ^ 0xffffffff) >>> 0;
+  }
+
   const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
   /* -------------------- Boot -------------------- */
