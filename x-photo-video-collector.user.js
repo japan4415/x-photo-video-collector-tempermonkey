@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         X Photo Video Collector
 // @namespace    https://github.com/japan4415/x-photo-video-collector-tempermonkey
-// @version      0.5.0
+// @version      0.5.1
 // @description  Collect media post URLs and direct image/mp4 links from X profile media tabs.
 // @match        https://x.com/*
 // @run-at       document-idle
@@ -401,11 +401,17 @@
         waiter.reject(new Error('debug capture timeout'));
       }
     }, DEBUG_CAPTURE_TIMEOUT);
-    const tab = openDebugInBackground(tweet, token);
-    if (tab) state.debugTabRef = tab;
-    state.debugOpenedBackground = true;
-    setStatus('デバッグ用にツイート詳細をバックグラウンドで開きました');
-    debugLog('debug tab opened');
+    const opened = openDebugInBackground(tweet, token);
+    if (opened?.tab) state.debugTabRef = opened.tab;
+    state.debugOpenedBackground = opened?.mode === 'background' || opened?.mode === 'window-fallback';
+    if (opened?.mode === 'background') {
+      setStatus('デバッグ用にツイート詳細をバックグラウンドで開きました');
+    } else if (opened?.mode === 'window-fallback') {
+      setStatus('デバッグ用にツイート詳細を開きました（フォーカスが移動する場合があります）');
+    } else if (opened?.mode === 'same-tab') {
+      setStatus('デバッグ用タブを開けないため、同一タブへ遷移します');
+    }
+    debugLog('debug tab opened', { mode: opened?.mode || 'failed' });
     return { token, promise };
   }
 
@@ -428,38 +434,48 @@
 
   function openDebugInBackground(tweet, token = '') {
     const targetUrl = buildDebugUrlForTweet(tweet, token);
-    if (!targetUrl) return null;
+    if (!targetUrl) return { tab: null, mode: 'failed' };
     try {
-      const tab = openTabForceActive(targetUrl);
-      if (!tab) setStatus('デバッグ用タブのオープンに失敗しました');
-      return tab;
+      const opened = openTabInBackground(targetUrl);
+      if (!opened?.tab && opened?.mode !== 'same-tab') setStatus('デバッグ用タブのオープンに失敗しました');
+      return opened;
     } catch (err) {
       console.warn('failed to open debug tab', err);
       setStatus('デバッグ用タブのオープンに失敗しました');
-      return null;
+      return { tab: null, mode: 'failed' };
     }
   }
 
-  function openTabForceActive(url) {
-    let tab = null;
+  function openTabInBackground(url) {
     try {
       if (typeof GM !== 'undefined' && typeof GM.openInTab === 'function') {
-        tab = GM.openInTab(url, { active: true, insert: true, setParent: true });
+        const tab = GM.openInTab(url, { active: false, insert: true, setParent: true });
+        if (tab) return { tab, mode: 'background' };
       } else if (typeof GM_openInTab === 'function') {
-        tab = GM_openInTab(url, { active: true, insert: true, setParent: true });
+        const tab = GM_openInTab(url, { active: false, insert: true, setParent: true });
+        if (tab) return { tab, mode: 'background' };
       }
     } catch (err) {
       console.debug(LOG_PREFIX, 'GM open tab failed', err?.message || err);
     }
-    if (!tab) {
-      const w = window.open(url, '_blank');
-      if (w) tab = w;
+
+    try {
+      const w = window.open(url, '_blank', 'noopener,noreferrer');
+      if (w) {
+        try { w.blur(); } catch { /* noop */ }
+        setTimeout(() => { try { window.focus(); } catch { /* noop */ } }, 50);
+        return { tab: w, mode: 'window-fallback' };
+      }
+    } catch (err) {
+      console.debug(LOG_PREFIX, 'window.open failed', err?.message || err);
     }
-    if (!tab) {
-      try { location.assign(url); } catch { /* noop */ }
+
+    try {
+      location.assign(url);
+      return { tab: null, mode: 'same-tab' };
+    } catch {
+      return { tab: null, mode: 'failed' };
     }
-    setTimeout(() => { try { window.focus(); } catch { /* noop */ } }, 800);
-    return tab || null;
   }
 
   function sendDebugCaptureMessage(payload) {
