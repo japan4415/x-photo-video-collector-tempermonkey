@@ -1,11 +1,12 @@
 // ==UserScript==
 // @name         X Photo Video Collector
 // @namespace    https://github.com/japan4415/x-photo-video-collector-tempermonkey
-// @version      0.5.1
+// @version      0.5.2
 // @description  Collect media post URLs and direct image/mp4 links from X profile media tabs.
 // @match        https://x.com/*
 // @run-at       document-idle
 // @grant        GM_openInTab
+// @grant        GM_getValue
 // @grant        GM_setValue
 // @grant        GM_addValueChangeListener
 // @grant        GM_xmlhttpRequest
@@ -21,8 +22,12 @@
   'use strict';
 
   const DEBUG_CAPTURE_KEY = 'xm-debug-capture';
+  const MEDIA_FETCH_DELAY_KEY = 'xm-media-fetch-delay-seconds';
   const DEBUG_CAPTURE_TIMEOUT = 45000;
   const DEBUG_SNIPPET_LIMIT = 8000;
+  const DEFAULT_MEDIA_FETCH_DELAY_SECONDS = 10;
+  const MIN_MEDIA_FETCH_DELAY_SECONDS = 0;
+  const MAX_MEDIA_FETCH_DELAY_SECONDS = 600;
   const LOG_PREFIX = '[xm-debug]';
   const ZIP_LOCAL_FILE_HEADER_SIG = 0x04034b50;
   const ZIP_CENTRAL_DIRECTORY_SIG = 0x02014b50;
@@ -106,6 +111,9 @@
       }
       #${PANEL_ID} .xm-header{ padding:8px 10px; font-weight:700; font-size:12px; opacity:.9; display:flex; align-items:center; justify-content:space-between; gap:8px; }
       #${PANEL_ID} .xm-controls{ display:flex; gap:8px; padding:0 10px 8px 10px; flex-wrap:wrap; }
+      #${PANEL_ID} .xm-settings{ padding:0 10px 8px 10px; display:grid; gap:4px; }
+      #${PANEL_ID} .xm-setting{ display:flex; align-items:center; justify-content:space-between; gap:10px; font-size:11px; opacity:.85; }
+      #${PANEL_ID} .xm-setting-note{ font-size:10px; opacity:.6; }
       #${PANEL_ID} .xm-btn{
         appearance:none; outline:none; cursor:pointer;
         padding:8px 10px; border-radius:10px; border:1px solid rgba(255,255,255,.2);
@@ -114,6 +122,10 @@
       }
       #${PANEL_ID} .xm-btn:hover{ background: rgba(255,255,255,.12); }
       #${PANEL_ID} .xm-btn:disabled{ opacity:.45; cursor:not-allowed; }
+      #${PANEL_ID} .xm-input{
+        width: 72px; padding:4px 6px; border-radius:8px;
+        border:1px solid rgba(255,255,255,.2); background:rgba(255,255,255,.08); color:#fff;
+      }
       #${PANEL_ID} .xm-status{ padding: 4px 10px; font-size:11px; opacity:.85; border-top:1px solid rgba(255,255,255,.08); }
       #${PANEL_ID} .xm-list{ margin: 6px 10px 10px 10px; padding: 8px; border-radius: 8px;
         background: rgba(255,255,255,.04); overflow: auto; flex: 1 1 auto; }
@@ -140,6 +152,13 @@
         <button id="xm-btn-download" class="xm-btn" disabled>ZIPダウンロード</button>
         <button id="xm-btn-stop" class="xm-btn" style="display:none">停止</button>
       </div>
+      <div class="xm-settings">
+        <label class="xm-setting" for="xm-media-delay">
+          <span>取得間隔(秒)</span>
+          <input id="xm-media-delay" class="xm-input" type="number" min="0" max="600" step="1">
+        </label>
+        <div class="xm-setting-note">0で待機なし。既定は10秒。</div>
+      </div>
       <label style="padding:0 10px 8px 10px; display:flex; align-items:center; gap:6px; font-size:11px; opacity:.8;">
         <input type="checkbox" id="xm-debug-toggle" style="margin:0;">デバッグ（最初の1件のみ）
       </label>
@@ -157,6 +176,19 @@
     document.getElementById('xm-btn-url').addEventListener('click', onClickCollectUrls);
     document.getElementById('xm-btn-media').addEventListener('click', onClickCollectMedia);
     document.getElementById('xm-btn-download').addEventListener('click', onClickDownloadZip);
+    const delayInput = document.getElementById('xm-media-delay');
+    if (delayInput) {
+      delayInput.value = String(state.mediaFetchDelaySeconds);
+      const syncDelayInput = (announce) => {
+        const normalized = updateMediaFetchDelaySeconds(delayInput.value, {
+          announce,
+          fallback: state.mediaFetchDelaySeconds,
+        });
+        delayInput.value = String(normalized);
+      };
+      delayInput.addEventListener('change', () => syncDelayInput(true));
+      delayInput.addEventListener('blur', () => syncDelayInput(false));
+    }
     const debugToggle = document.getElementById('xm-debug-toggle');
     if (debugToggle) {
       debugToggle.checked = state.debug;
@@ -190,6 +222,61 @@
   }
   function removePanel() { const el = document.getElementById(PANEL_ID); if (el) el.remove(); }
   function setStatus(text) { const s = document.getElementById('xm-status'); if (s) s.textContent = text; }
+
+  function readStoredValue(key, fallback = '') {
+    try {
+      if (typeof GM_getValue === 'function') {
+        const value = GM_getValue(key);
+        if (value !== undefined && value !== null && value !== '') return value;
+      }
+    } catch {
+      // noop
+    }
+    try {
+      const value = localStorage.getItem(key);
+      if (value !== null && value !== '') return value;
+    } catch {
+      // noop
+    }
+    return fallback;
+  }
+
+  function writeStoredValue(key, value) {
+    if (typeof GM_setValue === 'function') {
+      try { GM_setValue(key, value); } catch { /* noop */ }
+    }
+    try {
+      localStorage.setItem(key, String(value));
+    } catch {
+      // noop
+    }
+  }
+
+  function clampMediaFetchDelaySeconds(value) {
+    return Math.min(MAX_MEDIA_FETCH_DELAY_SECONDS, Math.max(MIN_MEDIA_FETCH_DELAY_SECONDS, value));
+  }
+
+  function normalizeMediaFetchDelaySeconds(value, fallback = DEFAULT_MEDIA_FETCH_DELAY_SECONDS) {
+    const raw = value === '' || value === null || value === undefined ? fallback : value;
+    const parsed = Number(raw);
+    if (!Number.isFinite(parsed)) return clampMediaFetchDelaySeconds(Number(fallback) || DEFAULT_MEDIA_FETCH_DELAY_SECONDS);
+    return clampMediaFetchDelaySeconds(Math.round(parsed));
+  }
+
+  function loadMediaFetchDelaySeconds() {
+    const stored = readStoredValue(MEDIA_FETCH_DELAY_KEY, DEFAULT_MEDIA_FETCH_DELAY_SECONDS);
+    return normalizeMediaFetchDelaySeconds(stored, DEFAULT_MEDIA_FETCH_DELAY_SECONDS);
+  }
+
+  function updateMediaFetchDelaySeconds(value, { announce = false, fallback = DEFAULT_MEDIA_FETCH_DELAY_SECONDS } = {}) {
+    const normalized = normalizeMediaFetchDelaySeconds(value, fallback);
+    state.mediaFetchDelaySeconds = normalized;
+    writeStoredValue(MEDIA_FETCH_DELAY_KEY, normalized);
+    if (announce) {
+      setStatus(`メディア取得の待機時間を ${normalized} 秒に設定しました`);
+    }
+    return normalized;
+  }
 
   function debugLog(...args) {
     if (!state.debug && !shouldCloseDebugTabAfterSend) return;
@@ -385,14 +472,14 @@
     });
     state.debugCaptureWaiters.set(token, { resolve: resolveFn, reject: rejectFn, promise });
     state.debugCaptureToken = token;
-    setDebugHtml('(debug) JavaScript無効のページを検出: バックグラウンドのツイート詳細を解析中…');
+    setDebugHtml('(debug) JavaScript無効のページを検出: ツイート詳細タブを開いて解析中…');
     debugLog('startDebugCapture', { token, tweet });
     clearDebugCaptureTimeout();
     state.debugCaptureTimer = setTimeout(() => {
       if (state.debugCaptureToken !== token) return;
       state.debugCaptureTimer = null;
       state.debugCaptureToken = null;
-      setDebugHtml('(debug) バックグラウンドのツイートDOM取得がタイムアウトしました');
+      setDebugHtml('(debug) ツイート詳細タブからのDOM取得がタイムアウトしました');
       setStatus('デバッグタブから応答がありません (timeout)');
       debugLog('debug capture timeout');
       const waiter = state.debugCaptureWaiters.get(token);
@@ -401,15 +488,14 @@
         waiter.reject(new Error('debug capture timeout'));
       }
     }, DEBUG_CAPTURE_TIMEOUT);
-    const opened = openDebugInBackground(tweet, token);
+    const opened = openCaptureTab(tweet, token);
     if (opened?.tab) state.debugTabRef = opened.tab;
-    state.debugOpenedBackground = opened?.mode === 'background' || opened?.mode === 'window-fallback';
-    if (opened?.mode === 'background') {
-      setStatus('デバッグ用にツイート詳細をバックグラウンドで開きました');
+    if (opened?.mode === 'active') {
+      setStatus('メディア取得用にツイート詳細をアクティブタブで開きました');
     } else if (opened?.mode === 'window-fallback') {
-      setStatus('デバッグ用にツイート詳細を開きました（フォーカスが移動する場合があります）');
+      setStatus('メディア取得用にツイート詳細を新規タブで開きました');
     } else if (opened?.mode === 'same-tab') {
-      setStatus('デバッグ用タブを開けないため、同一タブへ遷移します');
+      setStatus('新規タブを開けないため、同一タブへ遷移します');
     }
     debugLog('debug tab opened', { mode: opened?.mode || 'failed' });
     return { token, promise };
@@ -432,28 +518,28 @@
     }
   }
 
-  function openDebugInBackground(tweet, token = '') {
+  function openCaptureTab(tweet, token = '') {
     const targetUrl = buildDebugUrlForTweet(tweet, token);
     if (!targetUrl) return { tab: null, mode: 'failed' };
     try {
-      const opened = openTabInBackground(targetUrl);
-      if (!opened?.tab && opened?.mode !== 'same-tab') setStatus('デバッグ用タブのオープンに失敗しました');
+      const opened = openTabActive(targetUrl);
+      if (!opened?.tab && opened?.mode !== 'same-tab') setStatus('ツイート詳細タブのオープンに失敗しました');
       return opened;
     } catch (err) {
       console.warn('failed to open debug tab', err);
-      setStatus('デバッグ用タブのオープンに失敗しました');
+      setStatus('ツイート詳細タブのオープンに失敗しました');
       return { tab: null, mode: 'failed' };
     }
   }
 
-  function openTabInBackground(url) {
+  function openTabActive(url) {
     try {
       if (typeof GM !== 'undefined' && typeof GM.openInTab === 'function') {
-        const tab = GM.openInTab(url, { active: false, insert: true, setParent: true });
-        if (tab) return { tab, mode: 'background' };
+        const tab = GM.openInTab(url, { active: true, insert: true, setParent: true });
+        if (tab) return { tab, mode: 'active' };
       } else if (typeof GM_openInTab === 'function') {
-        const tab = GM_openInTab(url, { active: false, insert: true, setParent: true });
-        if (tab) return { tab, mode: 'background' };
+        const tab = GM_openInTab(url, { active: true, insert: true, setParent: true });
+        if (tab) return { tab, mode: 'active' };
       }
     } catch (err) {
       console.debug(LOG_PREFIX, 'GM open tab failed', err?.message || err);
@@ -462,8 +548,7 @@
     try {
       const w = window.open(url, '_blank', 'noopener,noreferrer');
       if (w) {
-        try { w.blur(); } catch { /* noop */ }
-        setTimeout(() => { try { window.focus(); } catch { /* noop */ } }, 50);
+        try { w.focus(); } catch { /* noop */ }
         return { tab: w, mode: 'window-fallback' };
       }
     } catch (err) {
@@ -669,8 +754,8 @@
     tweets: [],
     media: [],
     debug: false,
+    mediaFetchDelaySeconds: loadMediaFetchDelaySeconds(),
     debugHtmlRaw: '',
-    debugOpenedBackground: false,
     debugCaptureToken: null,
     debugCaptureTimer: null,
     debugTabRef: null,
@@ -736,7 +821,6 @@
     const btnStop = document.getElementById('xm-btn-stop');
     btnUrl.disabled = true; btnMedia.disabled = true; btnDownload.disabled = true; btnStop.style.display = '';
     state.media = [];
-    state.debugOpenedBackground = false;
     clearDebugCaptureTimeout();
     state.debugCaptureToken = null;
     state.debugTabRef = null;
@@ -777,7 +861,7 @@
           debugLog('tweet media fetch error', err?.message || err);
         }
         if (i < targetTweets.length - 1 && !stopFlag) {
-          await sleep(2000);
+          await waitBetweenMediaFetches(i + 1, targetTweets.length);
         }
       }
 
@@ -797,6 +881,19 @@
       btnStop.style.display = 'none';
       btnUrl.disabled = false;
       btnMedia.disabled = false;
+    }
+  }
+
+  async function waitBetweenMediaFetches(completedCount, totalCount) {
+    const totalMs = Math.max(0, state.mediaFetchDelaySeconds) * 1000;
+    if (!totalMs) return;
+    let remainingMs = totalMs;
+    while (remainingMs > 0 && !stopFlag) {
+      const remainingSec = Math.ceil(remainingMs / 1000);
+      setStatus(`次のツイート待機中 (${completedCount}/${totalCount} 完了): 残り ${remainingSec} 秒`);
+      const step = Math.min(1000, remainingMs);
+      await sleep(step);
+      remainingMs -= step;
     }
   }
 
@@ -1145,7 +1242,7 @@
             }
           }
         } else {
-          setDebugHtml('(debug) バックグラウンドのツイート詳細からHTML取得待ちです…', html);
+          setDebugHtml('(debug) ツイート詳細タブからHTML取得待ちです…', html);
           debugLog('waiting for debug capture (promise missing)');
         }
       } catch (err) {
