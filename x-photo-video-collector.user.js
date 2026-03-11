@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         X Photo Video Collector
 // @namespace    https://github.com/japan4415/x-photo-video-collector-tempermonkey
-// @version      0.5.2
+// @version      0.5.3
 // @description  Collect media post URLs and direct image/mp4 links from X profile media tabs.
 // @match        https://x.com/*
 // @run-at       document-idle
@@ -28,6 +28,8 @@
   const DEFAULT_MEDIA_FETCH_DELAY_SECONDS = 10;
   const MIN_MEDIA_FETCH_DELAY_SECONDS = 0;
   const MAX_MEDIA_FETCH_DELAY_SECONDS = 600;
+  const X_PUBLIC_GRAPHQL_BEARER_TOKEN = 'Bearer AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I8xnZz4puTs=1Zv7ttfk8LF81IUq16cHjhLTvJu4FA33AGWWjCpTnA';
+  const TWEET_RESULT_BY_REST_ID_QUERY_ID = 'Ljmm6K6R_hgJ7A1RJ2XSpw';
   const LOG_PREFIX = '[xm-debug]';
   const ZIP_LOCAL_FILE_HEADER_SIG = 0x04034b50;
   const ZIP_CENTRAL_DIRECTORY_SIG = 0x02014b50;
@@ -249,6 +251,18 @@
       localStorage.setItem(key, String(value));
     } catch {
       // noop
+    }
+  }
+
+  function getCookieValue(name) {
+    if (!name) return '';
+    const escaped = String(name).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const match = document.cookie.match(new RegExp(`(?:^|;\\s*)${escaped}=([^;]*)`));
+    if (!match) return '';
+    try {
+      return decodeURIComponent(match[1]);
+    } catch {
+      return match[1] || '';
     }
   }
 
@@ -668,7 +682,7 @@
       return /pbs\.twimg\.com/.test(style);
     });
     if (hasBg) return true;
-    if (root.querySelector('video[src*="video.twimg.com"], video source[src*="video.twimg.com"], source[src*="video.twimg.com"], a[href*="video.twimg.com"]')) return true;
+    if (root.querySelector('video, source[src^="blob:"], source[src*="video.twimg.com"], a[href*="video.twimg.com"]')) return true;
     return false;
   }
 
@@ -1176,6 +1190,18 @@
   }
 
   async function fetchTweetMedia(tweet, captureHtml = false) {
+    const tryApiFallback = async (items, reason) => {
+      const currentItems = Array.isArray(items) ? items : [];
+      const hasVideo = currentItems.some(item => item?.type === 'mp4');
+      const shouldFetchApi = currentItems.length === 0 || (tweet?.hints?.hasVideo && !hasVideo);
+      if (!shouldFetchApi) return currentItems;
+      const apiItems = await fetchTweetMediaViaApi(tweet);
+      if (!apiItems.length) return currentItems;
+      const merged = mergeMediaItems(currentItems, apiItems);
+      debugLog('media merged with api fallback', { reason, before: currentItems.length, api: apiItems.length, after: merged.length });
+      return merged;
+    };
+
     const endpoints = [];
     if (tweet.detailPath) {
       try {
@@ -1209,14 +1235,14 @@
     }
     if (!html) {
       if (captureHtml) setDebugHtml('(debug) HTML取得に失敗しました');
-      return [];
+      return tryApiFallback([], 'fetch-failed');
     }
 
     const parser = new DOMParser();
     const doc = parser.parseFromString(html, 'text/html');
     if (!doc) {
       if (captureHtml) setDebugHtml('(debug) HTML のパースに失敗しました');
-      return [];
+      return tryApiFallback([], 'parse-failed');
     }
 
     const looksDisabled = /JavaScriptを使用できません/.test(html) || html.includes('id="ScriptLoadFailure"');
@@ -1229,10 +1255,14 @@
           const mediaReadyFlag = (captureResult && typeof captureResult === 'object') ? captureResult.mediaReady : undefined;
           if (rawGroupHtml) {
             debugLog('processing debug HTML from capture', { length: rawGroupHtml.length, mediaReady: mediaReadyFlag });
-            const fromDebug = collectMediaFromDebugHtml(rawGroupHtml, tweet);
+            const fromDebug = await tryApiFallback(collectMediaFromDebugHtml(rawGroupHtml, tweet), 'debug-capture');
             debugLog('media collected from debug HTML', { count: fromDebug.length });
             if (fromDebug.length) {
-              setStatus(`デバッグHTMLからメディアを取得 (${fromDebug.length} 件)`);
+              if (fromDebug.some(item => item.type === 'mp4')) {
+                setStatus(`API補完を含めてメディアを取得 (${fromDebug.length} 件)`);
+              } else {
+                setStatus(`デバッグHTMLからメディアを取得 (${fromDebug.length} 件)`);
+              }
               return fromDebug;
             }
             if (mediaReadyFlag === false) {
@@ -1249,7 +1279,11 @@
         console.warn('debug capture flow failed', err);
         debugLog('debug capture flow failed', err?.message || err);
       }
-      return [];
+      const fromApi = await tryApiFallback([], 'script-load-failure');
+      if (fromApi.length) {
+        setStatus(`APIからメディアを取得 (${fromApi.length} 件)`);
+      }
+      return fromApi;
     }
 
     if (captureHtml) {
@@ -1267,9 +1301,171 @@
       }
     }
 
-    const collected = collectMediaFromDoc(doc, tweet);
+    const collected = await tryApiFallback(collectMediaFromDoc(doc, tweet), 'inline-document');
     debugLog('media collected from inline document', { count: collected.length });
     return collected;
+  }
+
+  function buildTweetResultByRestIdUrl(tweetId) {
+    const params = new URLSearchParams();
+    params.set('variables', JSON.stringify({
+      tweetId: String(tweetId),
+      withCommunity: false,
+      includePromotedContent: false,
+      withVoice: false,
+    }));
+    params.set('features', JSON.stringify({}));
+    params.set('fieldToggles', JSON.stringify({}));
+    return `https://api.x.com/graphql/${TWEET_RESULT_BY_REST_ID_QUERY_ID}/TweetResultByRestId?${params.toString()}`;
+  }
+
+  function buildTweetApiHeaders() {
+    const headers = {
+      authorization: X_PUBLIC_GRAPHQL_BEARER_TOKEN,
+      'x-twitter-active-user': 'yes',
+      'x-twitter-client-language': navigator.language || 'en',
+    };
+    const guestToken = getCookieValue('gt');
+    if (guestToken) headers['x-guest-token'] = guestToken;
+    const csrfToken = getCookieValue('ct0');
+    if (csrfToken) {
+      headers['x-csrf-token'] = csrfToken;
+      headers['x-twitter-auth-type'] = 'OAuth2Session';
+    }
+    return headers;
+  }
+
+  async function fetchTweetMediaViaApi(tweet) {
+    if (!tweet?.tweetId) return [];
+    try {
+      const resp = await fetch(buildTweetResultByRestIdUrl(tweet.tweetId), {
+        credentials: 'include',
+        headers: buildTweetApiHeaders(),
+      });
+      if (!resp.ok) {
+        debugLog('tweet api fetch failed', { tweetId: tweet.tweetId, status: resp.status });
+        return [];
+      }
+      const payload = await resp.json();
+      const items = collectMediaFromApiPayload(payload, tweet);
+      debugLog('media collected from tweet api', { tweetId: tweet.tweetId, count: items.length });
+      return items;
+    } catch (err) {
+      console.warn('tweet api fetch failed', tweet, err);
+      debugLog('tweet api fetch failed', err?.message || err);
+      return [];
+    }
+  }
+
+  function collectMediaFromApiPayload(payload, tweet) {
+    const aggregate = new Map();
+    const visited = new Set();
+
+    const visit = (node, label) => {
+      const result = unwrapTweetResult(node);
+      if (!result) return;
+      const visitKey = String(result.rest_id || result.legacy?.id_str || label || visited.size);
+      if (visited.has(visitKey)) return;
+      visited.add(visitKey);
+      const items = collectMediaFromTweetResult(result, tweet);
+      debugLog('collectMediaFromTweetResult', { label, count: items.length });
+      for (const item of items) {
+        const key = `${item.type}|${item.url}`;
+        if (!aggregate.has(key)) aggregate.set(key, item);
+      }
+      visit(result.retweeted_status_result, `${label}:retweet`);
+      visit(result.quoted_status_result, `${label}:quote`);
+    };
+
+    visit(payload?.data?.tweetResult, 'api-root');
+    return Array.from(aggregate.values());
+  }
+
+  function unwrapTweetResult(node) {
+    let current = node;
+    const seen = new Set();
+    while (current && typeof current === 'object' && !seen.has(current)) {
+      seen.add(current);
+      if (current.__typename === 'Tweet' || current.rest_id || current.legacy?.id_str) return current;
+      if (current.result) {
+        current = current.result;
+        continue;
+      }
+      if (current.tweet) {
+        current = current.tweet;
+        continue;
+      }
+      if (current.tweetResult) {
+        current = current.tweetResult;
+        continue;
+      }
+      if (current.tweet_results) {
+        current = current.tweet_results;
+        continue;
+      }
+      break;
+    }
+    return null;
+  }
+
+  function collectMediaFromTweetResult(result, tweet) {
+    const items = [];
+    const seen = new Set();
+    const mediaEntries = result?.legacy?.extended_entities?.media || result?.legacy?.entities?.media || [];
+    if (!Array.isArray(mediaEntries)) return items;
+
+    const pushItem = (type, rawUrl, meta = {}) => {
+      const normalized = type === 'img' ? normalizeImageUrl(rawUrl) : normalizeVideoUrl(rawUrl);
+      if (!normalized) return;
+      const key = `${type}|${normalized}`;
+      if (seen.has(key)) return;
+      seen.add(key);
+      items.push({
+        type,
+        url: normalized,
+        tweetId: tweet.tweetId,
+        screenName: tweet.screenName,
+        meta,
+      });
+    };
+
+    mediaEntries.forEach((media) => {
+      if (!media || typeof media !== 'object') return;
+      if (media.type === 'photo') {
+        pushItem('img', media.media_url_https || media.media_url, { mediaKey: media.media_key });
+        return;
+      }
+      if (media.type === 'video' || media.type === 'animated_gif') {
+        const bestVariant = pickBestVideoVariant(media.video_info?.variants);
+        if (bestVariant) {
+          pushItem('mp4', bestVariant.url, {
+            mediaKey: media.media_key,
+            bitrate: bestVariant.bitrate || 0,
+            durationMillis: media.video_info?.duration_millis || 0,
+          });
+        }
+      }
+    });
+
+    return items;
+  }
+
+  function pickBestVideoVariant(variants) {
+    if (!Array.isArray(variants)) return null;
+    const mp4Variants = variants.filter(variant => variant?.content_type === 'video/mp4' && variant.url);
+    if (!mp4Variants.length) return null;
+    mp4Variants.sort((a, b) => (Number(b.bitrate) || 0) - (Number(a.bitrate) || 0));
+    return mp4Variants[0] || null;
+  }
+
+  function mergeMediaItems(...groups) {
+    const aggregate = new Map();
+    groups.flat().forEach((item) => {
+      if (!item?.type || !item?.url) return;
+      const key = `${item.type}|${item.url}`;
+      if (!aggregate.has(key)) aggregate.set(key, item);
+    });
+    return Array.from(aggregate.values());
   }
 
   function collectMediaFromDebugHtml(html, tweet) {
